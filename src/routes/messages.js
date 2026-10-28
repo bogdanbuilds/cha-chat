@@ -7,7 +7,7 @@ function parsePositiveInteger(value) {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
-function createMessagesRouter({ db, tokenSecret }) {
+function createMessagesRouter({ db, tokenSecret, sseHub }) {
   const router = express.Router();
   router.use(requireAuth({ db, tokenSecret }));
 
@@ -41,13 +41,15 @@ function createMessagesRouter({ db, tokenSecret }) {
         SELECT m.id, m.room_id AS roomId, m.seq, m.user_id AS userId, u.username, m.body, m.created_at AS createdAt
         FROM messages m JOIN users u ON u.id = m.user_id WHERE m.id = ?
       `).get(Number(result.lastInsertRowid));
-      return res.status(201).json({ message: {
+      const persistedMessage = {
         ...message,
         id: Number(message.id),
         roomId: Number(message.roomId),
         seq: Number(message.seq),
         userId: Number(message.userId),
-      } });
+      };
+      sseHub.publish(req.roomId, persistedMessage);
+      return res.status(201).json({ message: persistedMessage });
     } catch (error) {
       db.exec('ROLLBACK');
       throw error;
