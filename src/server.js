@@ -1,5 +1,6 @@
 const express = require('express');
 const { randomBytes } = require('node:crypto');
+const path = require('node:path');
 const { createDatabase } = require('./db');
 const { requireAuth } = require('./auth');
 const { createAuthRouter } = require('./routes/auth');
@@ -17,6 +18,7 @@ function createApp({ db = createDatabase(), tokenSecret = process.env.AUTH_TOKEN
   app.use('/api/rooms', createRoomsRouter({ db, tokenSecret }));
   app.use('/api/rooms', createMessagesRouter({ db, tokenSecret, sseHub }));
   app.use('/api/rooms', createStreamRouter({ db, tokenSecret, sseHub }));
+  app.use(express.static(path.join(__dirname, '..', 'public')));
   app.use((error, req, res, next) => {
     if (res.headersSent) return next(error);
     return res.status(500).json({ error: 'Internal server error' });

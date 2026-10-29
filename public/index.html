@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cha Chat</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.45 system-ui, sans-serif; }
+    body { max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+    h1, h2, p { margin-top: 0; }
+    input, button { font: inherit; padding: .5rem .65rem; }
+    button { cursor: pointer; }
+    input { max-width: 100%; }
+    form { display: flex; flex-wrap: wrap; gap: .5rem; margin: .75rem 0; }
+    .panel { border: 1px solid #8887; border-radius: .5rem; padding: 1rem; margin: 1rem 0; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+    #rooms { display: flex; flex-wrap: wrap; gap: .5rem; }
+    #messages { min-height: 12rem; max-height: 55vh; overflow-y: auto; border: 1px solid #8887; padding: .75rem; margin: .75rem 0; }
+    .message { padding: .3rem 0; border-bottom: 1px solid #8883; overflow-wrap: anywhere; }
+    .message time { opacity: .7; font-size: .85em; margin-left: .5rem; }
+    #status { min-height: 1.5em; }
+    .muted { opacity: .75; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <h1>Cha Chat</h1>
+  <p id="status" role="status" aria-live="polite"></p>
+
+  <section id="authPanel" class="panel">
+    <h2 id="authTitle">Log in</h2>
+    <form id="authForm">
+      <label>Username <input name="username" autocomplete="username" required minlength="3" maxlength="32"></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required minlength="8"></label>
+      <button id="authSubmit" type="submit">Log in</button>
+      <button id="authMode" type="button">Create account</button>
+    </form>
+  </section>
+
+  <main id="appPanel" hidden>
+    <header class="topbar panel">
+      <div>Signed in as <strong id="identity"></strong></div>
+      <button id="logout" type="button">Log out</button>
+    </header>
+
+    <section class="panel">
+      <h2>Rooms</h2>
+      <form id="createRoomForm">
+        <label>New room <input name="name" required maxlength="80" placeholder="Room name"></label>
+        <button type="submit">Create room</button>
+      </form>
+      <button id="refreshRooms" type="button">Refresh rooms</button>
+      <div id="rooms" aria-label="Your rooms"></div>
+      <p id="noRooms" class="muted" hidden>No rooms yet. Create one to get started.</p>
+    </section>
+
+    <section id="chatPanel" class="panel" hidden>
+      <div class="topbar">
+        <h2 id="roomTitle">Room</h2>
+        <span id="connectionState" class="muted">Select a room</span>
+      </div>
+      <form id="addMemberForm" hidden>
+        <label>Add member by account ID <input name="userId" type="number" min="1" step="1" required></label>
+        <button type="submit">Add member</button>
+      </form>
+      <p id="inviteHelp" class="muted" hidden>Ask the other person for their account ID, shown beside their username after login.</p>
+      <div id="messages" aria-live="polite" aria-label="Messages"></div>
+      <form id="messageForm">
+        <label>Message <input name="body" required maxlength="4000" autocomplete="off" placeholder="Write a message"></label>
+        <button type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      const $ = (selector) => document.querySelector(selector);
+      const authPanel = $('#authPanel');
+      const appPanel = $('#appPanel');
+      const status = $('#status');
+      let token = localStorage.getItem('cha-chat-token');
+      let currentUser = null;
+      let activeRoom = null;
+      let streamController = null;
+      let authMode = 'login';
+      const renderedSequences = new Set();
+
+      function showStatus(message = '') { status.textContent = message; }
+
+      async function api(path, options = {}) {
+        const headers = { ...(options.body ? { 'content-type': 'application/json' } : {}), ...(options.headers || {}) };
+        if (token) headers.authorization = `Bearer ${token}`;
+        const response = await fetch(path, { ...options, headers });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+        return payload;
+      }
+
+      function showSignedIn(user) {
+        currentUser = user;
+        authPanel.hidden = true;
+        appPanel.hidden = false;
+        $('#identity').textContent = `${user.username} (ID ${user.id})`;
+      }
+
+      function appendMessage(message) {
+        const sequence = Number(message.seq);
+        if (renderedSequences.has(sequence)) return;
+        renderedSequences.add(sequence);
+        const row = document.createElement('div');
+        row.className = 'message';
+        const author = document.createElement('strong');
+        author.textContent = message.username;
+        const body = document.createElement('span');
+        body.textContent = `: ${message.body}`;
+        const time = document.createElement('time');
+        time.textContent = new Date(message.createdAt).toLocaleTimeString();
+        row.append(author, body, time);
+        $('#messages').append(row);
+        $('#messages').scrollTop = $('#messages').scrollHeight;
+      }
+
+      function stopStream() {
+        if (streamController) streamController.abort();
+        streamController = null;
+      }
+
+      async function startStream(roomId, initialCursor) {
+        stopStream();
+        const controller = new AbortController();
+        streamController = controller;
+        let lastEventId = initialCursor;
+        $('#connectionState').textContent = 'Connecting…';
+
+        while (!controller.signal.aborted && activeRoom && activeRoom.id === roomId) {
+          try {
+            const response = await fetch(`/api/rooms/${roomId}/stream`, {
+              headers: { authorization: `Bearer ${token}`, 'last-event-id': String(lastEventId) },
+              signal: controller.signal,
+            });
+            if (!response.ok) {
+              const payload = await response.json().catch(() => ({}));
+              if (response.status < 500) {
+                showStatus(payload.error || `Stream failed (${response.status})`);
+                $('#connectionState').textContent = 'Unavailable';
+                return;
+              }
+              throw new Error(payload.error || `Stream failed (${response.status})`);
+            }
+            $('#connectionState').textContent = 'Live';
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (!controller.signal.aborted) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              let separator;
+              while ((separator = buffer.indexOf('\n\n')) !== -1) {
+                const block = buffer.slice(0, separator);
+                buffer = buffer.slice(separator + 2);
+                let eventId;
+                let data = '';
+                for (const line of block.split(/\r?\n/)) {
+                  if (line.startsWith('id:')) eventId = line.slice(3).trim();
+                  else if (line.startsWith('data:')) data += (data ? '\n' : '') + line.slice(5).trimStart();
+                }
+                if (data) {
+                  const message = JSON.parse(data);
+                  if (eventId) lastEventId = Number(eventId);
+                  appendMessage(message);
+                }
+              }
+            }
+          } catch (error) {
+            if (controller.signal.aborted) return;
+            $('#connectionState').textContent = 'Reconnecting…';
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+
+      async function loadRooms() {
+        const { rooms } = await api('/api/rooms');
+        const container = $('#rooms');
+        container.replaceChildren();
+        $('#noRooms').hidden = rooms.length !== 0;
+        for (const room of rooms) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.textContent = room.name;
+          button.addEventListener('click', () => selectRoom(room));
+          container.append(button);
+        }
+      }
+
+      $('#refreshRooms').addEventListener('click', () => {
+        loadRooms().then(() => showStatus('Rooms refreshed.')).catch((error) => showStatus(error.message));
+      });
+
+      async function selectRoom(room) {
+        stopStream();
+        activeRoom = room;
+        renderedSequences.clear();
+        $('#chatPanel').hidden = false;
+        $('#roomTitle').textContent = room.name;
+        $('#messages').replaceChildren();
+        $('#connectionState').textContent = 'Loading history…';
+        const canInvite = room.createdBy === currentUser.id;
+        $('#addMemberForm').hidden = !canInvite;
+        $('#inviteHelp').hidden = !canInvite;
+        try {
+          const { messages } = await api(`/api/rooms/${room.id}/messages?limit=50`);
+          for (const message of messages) appendMessage(message);
+          const cursor = messages.length ? messages[messages.length - 1].seq : 0;
+          startStream(room.id, cursor);
+        } catch (error) {
+          showStatus(error.message);
+          $('#connectionState').textContent = 'Unavailable';
+        }
+      }
+
+      $('#authMode').addEventListener('click', () => {
+        authMode = authMode === 'login' ? 'register' : 'login';
+        $('#authTitle').textContent = authMode === 'login' ? 'Log in' : 'Create account';
+        $('#authSubmit').textContent = authMode === 'login' ? 'Log in' : 'Create account';
+        $('#authMode').textContent = authMode === 'login' ? 'Create account' : 'Back to login';
+        $('input[name="password"]').autocomplete = authMode === 'login' ? 'current-password' : 'new-password';
+      });
+
+      $('#authForm').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const form = new FormData(event.currentTarget);
+        try {
+          const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
+          const result = await api(endpoint, {
+            method: 'POST',
+            body: JSON.stringify({ username: form.get('username'), password: form.get('password') }),
+          });
+          token = result.token;
+          localStorage.setItem('cha-chat-token', token);
+          const { user } = await api('/api/auth/me');
+          showSignedIn(user);
+          await loadRooms();
+          showStatus('');
+        } catch (error) { showStatus(error.message); }
+      });
+
+      $('#createRoomForm').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const formElement = event.currentTarget;
+        const name = new FormData(formElement).get('name');
+        try {
+          const { room } = await api('/api/rooms', { method: 'POST', body: JSON.stringify({ name }) });
+          formElement.reset();
+          await loadRooms();
+          await selectRoom(room);
+          showStatus('Room created. Add another account by its ID to invite it.');
+        } catch (error) { showStatus(error.message); }
+      });
+
+      $('#addMemberForm').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const formElement = event.currentTarget;
+        const userId = Number(new FormData(formElement).get('userId'));
+        try {
+          const { member } = await api(`/api/rooms/${activeRoom.id}/members`, {
+            method: 'POST', body: JSON.stringify({ userId }),
+          });
+          formElement.reset();
+          showStatus(`${member.username} added to ${activeRoom.name}.`);
+        } catch (error) { showStatus(error.message); }
+      });
+
+      $('#messageForm').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (!activeRoom) return;
+        const input = event.currentTarget.elements.body;
+        const body = input.value.trim();
+        if (!body) return;
+        try {
+          const { message } = await api(`/api/rooms/${activeRoom.id}/messages`, {
+            method: 'POST', body: JSON.stringify({ body }),
+          });
+          appendMessage(message);
+          input.value = '';
+          showStatus('');
+        } catch (error) { showStatus(error.message); }
+      });
+
+      $('#logout').addEventListener('click', () => {
+        stopStream();
+        token = null;
+        currentUser = null;
+        activeRoom = null;
+        localStorage.removeItem('cha-chat-token');
+        appPanel.hidden = true;
+        authPanel.hidden = false;
+        $('#chatPanel').hidden = true;
+        showStatus('');
+      });
+
+      if (token) api('/api/auth/me')
+        .then(({ user }) => { showSignedIn(user); return loadRooms(); })
+        .catch(() => { token = null; localStorage.removeItem('cha-chat-token'); });
+    })();
+  </script>
+</body>
+</html>
